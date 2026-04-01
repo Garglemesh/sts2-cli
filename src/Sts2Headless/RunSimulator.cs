@@ -1018,67 +1018,69 @@ public class RunSimulator
         // Enable SuppressYield so Task.Yield() runs inline during enemy turn processing.
         // This prevents deadlocks during boss fights (e.g., Vantom) where continuations
         // would otherwise be posted to ThreadPool and never complete.
+        // Keep SuppressYield=true through the initial fallback wait loop — multi-hit
+        // attacks (e.g., 10x2) have continuations between hits that also need suppression.
         YieldPatches.SuppressYield = true;
         try
         {
             PlayerCmd.EndTurn(player, canBackOut: false);
             _syncCtx.Pump();
+
+            // Fallback: if turn didn't complete synchronously, keep pumping with SuppressYield on
+            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            {
+                for (int i = 0; i < 50; i++)
+                {
+                    _syncCtx.Pump();
+                    if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                    if (CombatManager.Instance.IsPlayPhase) break;
+                    Thread.Sleep(5);
+                }
+            }
         }
         finally
         {
             YieldPatches.SuppressYield = false;
         }
 
-        // Fallback: if turn didn't complete synchronously, wait briefly then force retry
+        // Second fallback: if still stuck after SuppressYield window, cancel and retry.
+        // The WaitUntilQueue TCS is likely deadlocked.
         if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
         {
-            for (int i = 0; i < 50; i++)
+            Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
+            try
             {
+                RunManager.Instance.ActionExecutor.Cancel();
                 _syncCtx.Pump();
-                if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                if (CombatManager.Instance.IsPlayPhase) break;
-                Thread.Sleep(5);
-            }
+                Thread.Sleep(50);
+                _syncCtx.Pump();
 
-            // If STILL stuck, the WaitUntilQueue TCS is likely deadlocked.
-            // Cancel the ActionExecutor to break out, then re-trigger EndTurn.
-            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
-            {
-                Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
+                // Reset the player ready state and try again with SuppressYield
+                CombatManager.Instance.UndoReadyToEndTurn(player);
+                _syncCtx.Pump();
+
+                YieldPatches.SuppressYield = true;
                 try
                 {
-                    RunManager.Instance.ActionExecutor.Cancel();
+                    PlayerCmd.EndTurn(player, canBackOut: false);
                     _syncCtx.Pump();
-                    Thread.Sleep(50);
-                    _syncCtx.Pump();
-
-                    // Reset the player ready state and try again with SuppressYield
-                    CombatManager.Instance.UndoReadyToEndTurn(player);
-                    _syncCtx.Pump();
-
-                    YieldPatches.SuppressYield = true;
-                    try
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                        _syncCtx.Pump();
-                    }
-                    finally
-                    {
-                        YieldPatches.SuppressYield = false;
-                    }
-
-                    for (int i = 0; i < 100; i++)
-                    {
-                        _syncCtx.Pump();
-                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                        if (CombatManager.Instance.IsPlayPhase) break;
-                        Thread.Sleep(10);
-                    }
                 }
-                catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
+                finally
+                {
+                    YieldPatches.SuppressYield = false;
+                }
+
+                for (int i = 0; i < 100; i++)
+                {
+                    _syncCtx.Pump();
+                    if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                    if (CombatManager.Instance.IsPlayPhase) break;
+                    Thread.Sleep(10);
+                }
             }
+            catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
 
             // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
             // the enemy turn processing to complete with SuppressYield permanently on.
@@ -1135,7 +1137,10 @@ public class RunSimulator
                     if (CombatManager.Instance.IsPlayPhase)
                         Log("Nuclear fallback SUCCEEDED — play phase resumed");
                     else
-                        Log("Nuclear fallback FAILED — returning stuck state");
+                    {
+                        Log("Nuclear fallback FAILED — forcing game_over to escape deadlock");
+                        return GameOverState(false);
+                    }
                 }
                 catch (Exception ex)
                 {
