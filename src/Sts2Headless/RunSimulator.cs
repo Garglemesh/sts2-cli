@@ -2585,9 +2585,58 @@ public class RunSimulator
         // Treasure rooms give relics via TreasureRoomRelicSynchronizer
         Log("Treasure room — collecting rewards");
 
-        // BUG-013: Ensure any pending relic picking session is complete before starting new one
         WaitForActionExecutor();
         _syncCtx.Pump();
+
+        // TreasureRoom.EnterInternal opens a relic-picking session (BeginRelicPicking) that the
+        // headless must drive, otherwise (a) no relic is ever awarded and (b) the session stays
+        // open so the NEXT treasure room's BeginRelicPicking throws "relic picking session while
+        // one was already occurring!" (issue #56). Auto-pick the first offered relic: PickRelicLocally
+        // enqueues a PickRelicAction whose execution awards the relic and ends the session
+        // (OnPicked -> EndRelicVoting). An empty offer is closed with CompleteWithNoRelics.
+        try
+        {
+            var relicSync = RunManager.Instance.TreasureRoomRelicSynchronizer;
+            if (relicSync?.CurrentRelics != null)
+            {
+                // The actual relic grant normally lives in the UI node's RelicsAwarded handler
+                // (RelicCmd.Obtain per result), which is absent in headless. Capture the awarded
+                // results, then grant them ourselves after the pick resolves (granting inside the
+                // event — mid action-execution — risks re-entrancy).
+                List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>? awarded = null;
+                Action<List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>> capture = r => awarded = r;
+                relicSync.RelicsAwarded += capture;
+                try
+                {
+                    if (relicSync.CurrentRelics.Count > 0)
+                    {
+                        Log($"Auto-picking treasure relic 0 of {relicSync.CurrentRelics.Count}");
+                        relicSync.PickRelicLocally(0);
+                    }
+                    else
+                    {
+                        relicSync.CompleteWithNoRelics();
+                    }
+                    _syncCtx.Pump();
+                    WaitForActionExecutor();
+                    _syncCtx.Pump();
+                }
+                finally { relicSync.RelicsAwarded -= capture; }
+
+                if (awarded != null)
+                {
+                    foreach (var res in awarded)
+                    {
+                        if (res.relic != null && res.player != null)
+                            RelicCmd.Obtain(res.relic.ToMutable(), res.player).GetAwaiter().GetResult();
+                    }
+                    _syncCtx.Pump();
+                    WaitForActionExecutor();
+                    _syncCtx.Pump();
+                }
+            }
+        }
+        catch (Exception ex) { Log($"Treasure relic pick: {ex.Message}"); }
 
         try
         {
