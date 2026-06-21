@@ -517,7 +517,7 @@ public class RunSimulator
             Log($"RunState created, players={_runState.Players?.Count}");
 
             var netService = new NetSingleplayerGameService();
-            RunManager.Instance.SetUpSavedSinglePlayer(_runState, save);
+            RunManager.Instance.SetUpSavedSingleplayer(_runState, save);
             LocalContext.NetId = netService.NetId;
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
@@ -3067,12 +3067,59 @@ public class RunSimulator
         return ctx;
     }
 
+    /// <summary>
+    /// Mark ModManager as finished (with no mods) so ReflectionHelper.ModTypes is usable in
+    /// headless mode. v0.107.1 throws from get_ModTypes() until ModManager.State != None.
+    /// We set State = Skipped (the "ran, declined to load mods" value) and seed an empty
+    /// _modTypes array via reflection, avoiding the real Initialize(fileIo, settings, version)
+    /// path which needs Steam/filesystem mod discovery.
+    /// </summary>
+    private static void EnsureModManagerInitialized()
+    {
+        const BindingFlags SF = BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public;
+        try
+        {
+            var modMgr = typeof(MegaCrit.Sts2.Core.Modding.ModManager);
+
+            // Allow the test/headless init path where the game checks for it.
+            modMgr.GetField("_allowInitForTests", SF)?.SetValue(null, true);
+
+            // Ensure an (empty) mod list so GetLoadedMods()/iteration never NREs.
+            var modsField = modMgr.GetField("_mods", SF);
+            if (modsField != null && modsField.GetValue(null) == null)
+                modsField.SetValue(null, Activator.CreateInstance(modsField.FieldType));
+
+            // Flip State None → Skipped via the auto-property backing field.
+            var stateField = modMgr.GetField("<State>k__BackingField", SF);
+            if (stateField != null)
+                stateField.SetValue(null, Enum.Parse(stateField.FieldType, "Skipped"));
+
+            // Seed ReflectionHelper._modTypes so get_ModTypes() returns instead of throwing.
+            var reflHelper = typeof(MegaCrit.Sts2.Core.Helpers.ReflectionHelper);
+            var modTypesField = reflHelper.GetField("_modTypes", SF);
+            if (modTypesField != null && modTypesField.GetValue(null) == null)
+                modTypesField.SetValue(null, Array.Empty<Type>());
+
+            Console.Error.WriteLine("[INFO] ModManager marked initialized (headless, no mods)");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] EnsureModManagerInitialized: {ex.Message}");
+        }
+    }
+
     private static void EnsureModelDbInitialized()
     {
         if (_modelDbInitialized) return;
         _modelDbInitialized = true;
 
         TestMode.IsOn = true;
+
+        // v0.107.1 gates ReflectionHelper.ModTypes behind ModManager initialization:
+        // RunState.CreateForTest → BadgeModels → GetSubtypesInMods throws
+        // "ModManager is not finished initializing!" unless ModManager has run.
+        // Headless never loads mods, so short-circuit the gate reflectively.
+        EnsureModManagerInitialized();
 
         // Install inline sync context on main thread
         SynchronizationContext.SetSynchronizationContext(_syncCtx);
@@ -3367,11 +3414,14 @@ public class RunSimulator
         private ManualResetEventSlim? _rewardWait;
         private int _rewardChoice = -1;
 
-        // NOTE: STS2 build 23372702 changed ICardSelector.GetSelectedCardReward to return
-        // a CardRewardSelection struct { CardModel card; CardRewardAlternative alternative }.
-        // CardReward.OnSelect interprets: alternative != null → pick that alternative
-        // (Skip/Reroll); else card != null → take that card; both null → skip (no card kept).
-        public MegaCrit.Sts2.Core.TestSupport.CardRewardSelection GetSelectedCardReward(
+        // NOTE: ICardSelector.GetSelectedCardReward return type has churned across STS2 builds:
+        //   build 23372702 → CardRewardSelection struct { CardModel card; CardRewardAlternative alternative }
+        //   a later build  → CardModel directly
+        //   v0.107.1       → CardRewardSelection struct again (current target)
+        // CardReward.OnSelect interprets: non-null card → take that card; null card → skip (no card kept).
+        // The headless adapter only ever picks a card index or skips, so a null `alternative` with a
+        // null `card` covers the skip case.
+        public CardRewardSelection GetSelectedCardReward(
             IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
             IReadOnlyList<CardRewardAlternative> alternatives)
         {
@@ -3390,8 +3440,8 @@ public class RunSimulator
             _rewardWait = null;
 
             if (choice >= 0 && choice < options.Count)
-                return new MegaCrit.Sts2.Core.TestSupport.CardRewardSelection { card = options[choice].Card };
-            return default;  // Skip (card=null, alternative=null)
+                return new CardRewardSelection { card = options[choice].Card };
+            return default;  // Skip (no card kept)
         }
 
         public bool HasPendingReward => PendingRewardCards != null && _rewardWait != null;

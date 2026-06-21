@@ -5,13 +5,20 @@
 Any code change MUST pass a full regression test before claiming completion:
 
 ```bash
-# Run 5 games per character, ALL must complete (0 crashes/stuck)
+# Run 5 games per character, ALL must complete (0 crashes/stuck).
+# play.py/play_full_run.py auto-detect the game dir and set STS2_GAME_DIR to lib/.
+# To override (e.g. point at the Steam install directly), export STS2_GAME_DIR first.
 for char in Ironclad Silent Defect Regent Necrobinder; do
-    STS2_GAME_DIR="$HOME/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_arm64" python3 python/play_full_run.py 5 "$char" 2>&1 | grep -E "Wins|Completed"
-do
+    python3 python/play_full_run.py 5 "$char" 2>&1 | grep -E "Wins|Completed"
+done
 ```
 
-Expected: `Completed: 5/5` for every character.
+Expected: `Completed: 5/5` for every character. (`Wins` will usually be 0 — the
+batch tool drives a random agent; the bar is completion without crashes/stuck.)
+
+Game dir per platform:
+- Linux:   `~/.steam/steam/steamapps/common/Slay the Spire 2/data_sts2_linuxbsd_x86_64`
+- macOS:   `~/Library/Application Support/Steam/.../Resources/data_sts2_macos_arm64`
 
 ## Localization
 

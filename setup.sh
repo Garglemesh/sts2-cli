@@ -26,10 +26,17 @@ if [ -z "$GAME_DIR" ]; then
             fi
             ;;
         Linux)
-            GAME_DIR="$HOME/.steam/steam/steamapps/common/Slay the Spire 2"
-            if [ ! -d "$GAME_DIR" ]; then
-                GAME_DIR="$HOME/.local/share/Steam/steamapps/common/Slay the Spire 2"
-            fi
+            # DLLs live in the data_sts2_linuxbsd_x86_64 subdir; prefer it directly,
+            # fall back to the game root (the DLL search below also walks subdirs).
+            for base in \
+                "$HOME/.steam/steam/steamapps/common/Slay the Spire 2" \
+                "$HOME/.local/share/Steam/steamapps/common/Slay the Spire 2"; do
+                if [ -d "$base/data_sts2_linuxbsd_x86_64" ]; then
+                    GAME_DIR="$base/data_sts2_linuxbsd_x86_64"; break
+                elif [ -d "$base" ]; then
+                    GAME_DIR="$base"; break
+                fi
+            done
             ;;
         MINGW*|MSYS*|CYGWIN*)
             GAME_DIR="C:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2"
