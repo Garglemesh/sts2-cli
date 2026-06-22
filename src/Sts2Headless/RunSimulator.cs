@@ -1012,9 +1012,13 @@ public class RunSimulator
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
         WaitForActionExecutor();
 
-        // Check if card play had no effect (hand unchanged, same card still at same index)
+        // Check if card play had no effect (hand unchanged, same card still at same index).
+        // Exception: some cards (e.g. Particle Wall) are 0-cost and intentionally return
+        // themselves to Hand after a successful play, so "still in hand" is expected and NOT
+        // a failure — flagging it killed otherwise-valid runs.
         var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card
+            && !ReturnsToHandOnPlay(card))
         {
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
@@ -3065,6 +3069,31 @@ public class RunSimulator
         catch { }
 
         return ctx;
+    }
+
+    // CardModel.GetResultPileTypeForCardPlay() is protected/virtual; cache the reflective handle.
+    private static System.Reflection.MethodInfo? _getResultPileMethod;
+
+    /// <summary>
+    /// True if this card is designed to return itself to the player's Hand after being played
+    /// (PileType.Hand == 2), e.g. Particle Wall ("Gain Block. Return this card to your Hand.").
+    /// Such cards legitimately remain in hand post-play, so the "still in hand" no-effect guard
+    /// must not treat them as failures.
+    /// </summary>
+    private static bool ReturnsToHandOnPlay(CardModel card)
+    {
+        try
+        {
+            _getResultPileMethod ??= typeof(CardModel).GetMethod(
+                "GetResultPileTypeForCardPlay",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var pile = _getResultPileMethod?.Invoke(card, null);  // virtual → dispatches to override
+            return pile != null && Convert.ToInt32(pile) == 2;    // PileType.Hand
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
