@@ -2287,6 +2287,27 @@ public class RunSimulator
             ["amount"] = pw.Amount,
         }).ToList();
 
+        // Lightweight card identity for the draw/discard/exhaust piles. Unlike `hand`, piles
+        // don't need resolved damage previews — only which cards are where. `hideOrder` sorts
+        // the list so the *contents* are visible but the upcoming draw sequence is not (the real
+        // game hides draw-pile order from the player).
+        List<Dictionary<string, object?>> SerializePile(MegaCrit.Sts2.Core.Entities.Cards.CardPile? pile, bool hideOrder)
+        {
+            var cards = pile?.Cards;
+            if (cards == null) return new();
+            var seq = cards.Select(c => new Dictionary<string, object?>
+            {
+                ["id"] = c.Id.ToString(),
+                ["name"] = _loc.Card(c.Id.Entry),
+                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                ["type"] = c.Type.ToString(),
+                ["upgraded"] = c.IsUpgraded,
+            });
+            if (hideOrder)
+                seq = seq.OrderBy(d => (string)d["id"]!).ThenBy(d => (bool)d["upgraded"]! ? 1 : 0);
+            return seq.ToList();
+        }
+
         var result = new Dictionary<string, object?>
         {
             ["type"] = "decision",
@@ -2301,6 +2322,10 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            // Pile contents (see SerializePile). Draw pile order is intentionally hidden.
+            ["draw_pile"] = SerializePile(pcs?.DrawPile, hideOrder: true),
+            ["discard_pile"] = SerializePile(pcs?.DiscardPile, hideOrder: false),
+            ["exhaust_pile"] = SerializePile(pcs?.ExhaustPile, hideOrder: false),
         };
 
         // Character-specific mechanics
