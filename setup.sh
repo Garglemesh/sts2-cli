@@ -26,10 +26,17 @@ if [ -z "$GAME_DIR" ]; then
             fi
             ;;
         Linux)
-            GAME_DIR="$HOME/.steam/steam/steamapps/common/Slay the Spire 2"
-            if [ ! -d "$GAME_DIR" ]; then
-                GAME_DIR="$HOME/.local/share/Steam/steamapps/common/Slay the Spire 2"
-            fi
+            # DLLs live in the data_sts2_linuxbsd_x86_64 subdir; prefer it directly,
+            # fall back to the game root (the DLL search below also walks subdirs).
+            for base in \
+                "$HOME/.steam/steam/steamapps/common/Slay the Spire 2" \
+                "$HOME/.local/share/Steam/steamapps/common/Slay the Spire 2"; do
+                if [ -d "$base/data_sts2_linuxbsd_x86_64" ]; then
+                    GAME_DIR="$base/data_sts2_linuxbsd_x86_64"; break
+                elif [ -d "$base" ]; then
+                    GAME_DIR="$base"; break
+                fi
+            done
             ;;
         MINGW*|MSYS*|CYGWIN*)
             GAME_DIR="C:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2"
@@ -48,6 +55,35 @@ if [ ! -d "$GAME_DIR" ]; then
 fi
 
 echo "📁 Game directory: $GAME_DIR"
+
+# ── Version guard ──
+# This project tracks the game's *internal* API, which changes between STS2 patches.
+# Warn (don't block) when the installed game differs from the last build known to work,
+# so a silent Steam auto-update doesn't look like a mysterious break. See docs/COMPATIBILITY.md.
+
+KNOWN_GOOD_VERSION="v0.107.1"
+
+# release_info.json lives in the game root; GAME_DIR may be the data_* subdir.
+RELEASE_INFO=""
+for cand in "$GAME_DIR/release_info.json" "$GAME_DIR/../release_info.json" "$GAME_DIR/../../release_info.json"; do
+    if [ -f "$cand" ]; then RELEASE_INFO="$cand"; break; fi
+done
+
+if [ -n "$RELEASE_INFO" ]; then
+    # Parse without requiring jq (it isn't installed everywhere).
+    GAME_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$RELEASE_INFO" | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if [ -z "$GAME_VERSION" ]; then
+        echo "⚠️  Could not read version from $RELEASE_INFO (continuing)."
+    elif [ "$GAME_VERSION" = "$KNOWN_GOOD_VERSION" ]; then
+        echo "🎯 Game version: $GAME_VERSION (matches known-good build)"
+    else
+        echo "⚠️  Game version: $GAME_VERSION  —  this project was last verified on $KNOWN_GOOD_VERSION."
+        echo "    A different version may build/run fine, or may need source fixes for API drift."
+        echo "    If the build or startup fails, see docs/COMPATIBILITY.md for the fix workflow."
+    fi
+else
+    echo "ℹ️  release_info.json not found near the game dir; skipping version check."
+fi
 
 # ── Copy DLLs ──
 

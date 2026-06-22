@@ -24,6 +24,11 @@ cd sts2-cli
 
 Or just run `python3 python/play.py` — it auto-detects and sets up on first run.
 
+> **Game version:** verified on **STS2 `v0.107.1`** (Linux, .NET 9). This project drives
+> the game's *internal* APIs, which change between patches, so a Steam update can break the
+> build or startup. `setup.sh` warns if your installed version differs. If it breaks, see
+> [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the decompile-and-reconcile fix workflow.
+
 ## Play
 
 ```bash
