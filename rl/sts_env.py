@@ -37,6 +37,13 @@ MAX_HAND = 10          # fixed number of hand slots the action space exposes
 END_TURN_ACTION = MAX_HAND   # the last action id = "end turn"
 N_ACTIONS = MAX_HAND + 1
 
+# Status effects ("powers") the agent should see — keyed on the engine's English
+# power names (we run the engine in English). Amounts are normalized by ~5.
+POWER_VOCAB = ["strength", "dexterity", "vulnerable", "weak", "frail", "shrink"]
+POWER_INDEX = {name: i for i, name in enumerate(POWER_VOCAB)}
+P = len(POWER_VOCAB)
+NORM_POWER = 5.0
+
 # Rough normalizers so all observation numbers land in a similar (~0..1) range,
 # which helps neural nets learn. They don't need to be exact.
 MAX_HP = 80.0
@@ -65,6 +72,35 @@ def _pile_counts(cards: list[dict]) -> np.ndarray:
     return counts / NORM_PILE
 
 
+def _power_vec(powers: list[dict]) -> np.ndarray:
+    """Encode a list of status effects as a normalized amount per known power."""
+    vec = np.zeros(P, dtype=np.float32)
+    for pw in powers or []:
+        key = (pw.get("name") or "").lower()
+        if key in POWER_INDEX:
+            vec[POWER_INDEX[key]] = float(pw.get("amount", 0)) / NORM_POWER
+    return vec
+
+
+def _incoming_damage(enemy: dict) -> float:
+    """Total damage this enemy intends to deal next turn (0 if it isn't attacking)."""
+    dmg = 0.0
+    for it in enemy.get("intents") or []:
+        if it.get("total_damage") is not None:
+            dmg += float(it["total_damage"])
+        elif it.get("damage") is not None:
+            dmg += float(it["damage"]) * float(it.get("hits") or 1)
+    return dmg
+
+
+def _intent_flags(enemy: dict) -> tuple[float, float]:
+    """(is_attack, is_debuff) over the enemy's intents — what kind of move is coming."""
+    types = {(it.get("type") or "") for it in (enemy.get("intents") or [])}
+    is_attack = 1.0 if any("Attack" in t for t in types) else 0.0
+    is_debuff = 1.0 if any("Debuff" in t for t in types) else 0.0
+    return is_attack, is_debuff
+
+
 class StsCombatEnv(gym.Env):
     """One fixed Slay the Spire 2 combat as a Gymnasium environment."""
 
@@ -79,12 +115,16 @@ class StsCombatEnv(gym.Env):
         # --- Action space: play hand slot 0..9, or end turn (id 10). ---
         self.action_space = spaces.Discrete(N_ACTIONS)
 
-        # --- Observation space: a flat vector of floats. Layout:
+        # --- Observation space: a flat vector of floats. Layout (mirrors what a
+        #     human player can see):
         #   player  : hp, block, energy                              (3)
-        #   enemy   : hp_frac, block, intends_attack                 (3)
+        #   player powers : amount per POWER_VOCAB                   (P)
+        #   enemy   : hp_frac, block                                 (2)
+        #   enemy intent  : incoming_damage, is_attack, is_debuff    (3)
+        #   enemy powers  : amount per POWER_VOCAB                   (P)
         #   hand    : MAX_HAND slots x (card one-hot V + cost + playable)
         #   piles   : draw/discard/exhaust counts over V             (3V)
-        obs_dim = 3 + 3 + MAX_HAND * (V + 2) + 3 * V
+        obs_dim = 3 + P + 2 + 3 + P + MAX_HAND * (V + 2) + 3 * V
         self.observation_space = spaces.Box(
             low=-1.0, high=10.0, shape=(obs_dim,), dtype=np.float32
         )
@@ -168,13 +208,23 @@ class StsCombatEnv(gym.Env):
             float(p.get("block", 0)) / NORM_BLOCK,
             float(state.get("energy", 0)) / NORM_ENERGY,
         ], dtype=np.float32))
+        # player status effects (e.g. Shrink from the beetle)
+        parts.append(_power_vec(state.get("player_powers")))
         # enemy scalars
         e_max = max(1.0, float(enemy.get("max_hp", 1) or 1))
         parts.append(np.array([
             float(enemy.get("hp", 0)) / e_max,
             float(enemy.get("block", 0)) / NORM_BLOCK,
-            1.0 if enemy.get("intends_attack") else 0.0,
         ], dtype=np.float32))
+        # enemy intent: how much damage is coming, and what kind of move
+        is_attack, is_debuff = _intent_flags(enemy)
+        parts.append(np.array([
+            _incoming_damage(enemy) / MAX_HP,
+            is_attack,
+            is_debuff,
+        ], dtype=np.float32))
+        # enemy status effects (e.g. Vulnerable from Bash)
+        parts.append(_power_vec(enemy.get("powers")))
         # hand: MAX_HAND slots
         hand = state.get("hand") or []
         for i in range(MAX_HAND):
