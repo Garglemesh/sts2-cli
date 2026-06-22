@@ -1,0 +1,21 @@
+# Convenience wrapper: `docker compose run --rm trainer`
+# Requires nvidia-container-toolkit on the host for --gpus access.
+services:
+  trainer:
+    build: .
+    image: sts2-rl
+    # Live-edit training code + persist checkpoints without rebuilding the image.
+    # (The venv lives at /opt/venv, so mounting ./rl here does NOT shadow it.)
+    volumes:
+      - ./rl:/app/rl
+      - ./checkpoints:/app/checkpoints
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    command: bash

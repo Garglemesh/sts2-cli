@@ -13,3 +13,8 @@ obj/
 .obsidian/
 logs/
 saves/*
+# RL trainer
+rl/.venv/
+rl/**/__pycache__/
+checkpoints/
+*.tar.gz

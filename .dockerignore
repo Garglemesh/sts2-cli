@@ -1,0 +1,11 @@
+# Keep the build context small and force a clean in-image build.
+# NOTE: lib/ is intentionally NOT ignored — the engine needs the patched game DLLs.
+**/bin/
+**/obj/
+rl/.venv/
+checkpoints/
+logs/
+.git/
+*.tar.gz
+docs/
+saves/
