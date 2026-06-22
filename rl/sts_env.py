@@ -92,10 +92,10 @@ class StsCombatEnv(gym.Env):
     # ── Gym API ─────────────────────────────────────────────────────────────
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        # Simplest reliable reset: a fresh engine process per episode.
-        if self.engine is not None:
-            self.engine.close()
-        self.engine = Engine()
+        # Reuse one long-lived engine; reset_to_fixed_combat() does a fast in-process
+        # combat reset (~1-2ms) after the first (one-time ~0.8s) setup.
+        if self.engine is None:
+            self.engine = Engine()
         self.state = self.engine.reset_to_fixed_combat()
         self._prev_hp = float(self.state.get("player", {}).get("hp", MAX_HP))
         return self._encode(self.state), {}

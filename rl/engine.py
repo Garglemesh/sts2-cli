@@ -70,7 +70,8 @@ class Engine:
             env=env,
         )
         # The engine emits one line, {"type":"ready",...}, when it has booted.
-        self._read()
+        self.last = self._read()
+        self._started = False   # has start_run been done in this process yet?
 
     # --- raw IO -------------------------------------------------------------
     def _read(self) -> dict:
@@ -87,7 +88,8 @@ class Engine:
         """Send one command dict and return the engine's JSON reply."""
         self.proc.stdin.write(json.dumps(cmd) + "\n")
         self.proc.stdin.flush()
-        return self._read()
+        self.last = self._read()
+        return self.last
 
     # --- convenience --------------------------------------------------------
     def action(self, name: str, **args) -> dict:
@@ -99,33 +101,78 @@ class Engine:
 
     def reset_to_fixed_combat(self) -> dict:
         """
-        Start a fresh run and drive it to the start of our fixed combat.
-        Returns the engine's 'combat_play' state dict (HP, hand, enemies, …).
+        Return a fresh fixed-combat 'combat_play' state.
+
+        The first call does the expensive one-time setup (start_run + ModelDb init,
+        ~0.8s). Every call after that is an in-process *combat* reset (~1-2ms): we
+        leave the previous fight, restore HP + deck, and drop into a new identical
+        combat — no new process, no game re-init. This is the ~400x speedup that
+        makes training practical. Falls back to a full process respawn if the fast
+        path ever lands somewhere unexpected (engine crash, surprise decision).
         """
+        if not self._started:
+            return self._full_reset()
+        try:
+            return self._fast_reset()
+        except Exception:
+            self._respawn()
+            return self._full_reset()
+
+    def _full_reset(self) -> dict:
+        """One-time path: start a run, clear Neow, set the deck, enter combat."""
         state = self.send({
             "cmd": "start_run",
             "character": FIXED_CHARACTER,
             "seed": FIXED_SEED,
             "ascension": 0,
         })
-        # Clear any pre-combat decision screens (Neow, etc.) with simple defaults.
+        for _ in range(20):  # clear pre-combat screens (Neow, etc.)
+            if state.get("decision") not in _INTERMEDIATE:
+                break
+            state = self._resolve_intermediate(state)
+        self._started = True
+        return self._enter_fixed_combat()
+
+    def _fast_reset(self) -> dict:
+        """In-process path: drain the post-combat screen, then re-enter combat."""
+        # After a fight ends we're on card_reward (win) or game_over (loss). Skip any
+        # reward/selection screens so the run is in a clean state to enter a new room.
+        state = self.last
         for _ in range(20):
             dec = state.get("decision")
             if dec not in _INTERMEDIATE:
-                break
-            if dec == "event_choice":
-                state = self.action("choose_option", option_index=0)
-            elif dec == "bundle_select":
-                state = self.action("select_bundle", bundle_index=0)
-            elif dec == "card_select":
-                state = self.action("select_cards", indices="0")
-            elif dec == "card_reward":
-                state = self.action("skip_card_reward")
-
-        # Force a known deck, then drop straight into the chosen encounter.
-        self.send({"cmd": "set_player", "deck": FIXED_DECK})
-        state = self.send({"cmd": "enter_room", "type": "combat", "encounter": FIXED_ENCOUNTER})
+                break  # map_select / game_over / etc. — safe to enter a room
+            state = self._resolve_intermediate(state)
+        state = self._enter_fixed_combat()
+        if state.get("decision") != "combat_play":
+            raise RuntimeError(f"fast reset landed on {state.get('decision')}")
         return state
+
+    def _enter_fixed_combat(self) -> dict:
+        """Restore HP + fixed deck, then start the fixed encounter."""
+        self.send({"cmd": "set_player", "hp": 80, "deck": list(FIXED_DECK)})
+        return self.send({"cmd": "enter_room", "type": "combat", "encounter": FIXED_ENCOUNTER})
+
+    def _resolve_intermediate(self, state: dict) -> dict:
+        """Answer one Neow/reward/selection screen with a trivial default."""
+        dec = state.get("decision")
+        if dec == "event_choice":
+            return self.action("choose_option", option_index=0)
+        if dec == "bundle_select":
+            return self.action("select_bundle", bundle_index=0)
+        if dec == "card_select":
+            return self.action("select_cards", indices="0")
+        if dec == "card_reward":
+            return self.action("skip_card_reward")
+        return state
+
+    def _respawn(self) -> None:
+        """Kill and relaunch the engine process (fallback for a bad state)."""
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        self.__init__()  # re-boot a fresh process
 
     def close(self) -> None:
         try:
