@@ -140,8 +140,12 @@ class StsCombatEnv(gym.Env):
         # combat reset (~1-2ms) after the first (one-time ~0.8s) setup.
         if self.engine is None:
             self.engine = Engine()
-        # Pick a random encounter from the pool (self.np_random is seeded by Gym).
-        encounter = ENCOUNTER_POOL[self.np_random.integers(len(ENCOUNTER_POOL))]
+        # Pick a random encounter from the pool (self.np_random is seeded by Gym),
+        # unless one is forced via options={"encounter": ...} (used by eval).
+        if options and options.get("encounter"):
+            encounter = options["encounter"]
+        else:
+            encounter = ENCOUNTER_POOL[self.np_random.integers(len(ENCOUNTER_POOL))]
         self.state = self.engine.reset_to_combat(encounter)
         self._prev_hp = float(self.state.get("player", {}).get("hp", MAX_HP))
         return self._encode(self.state), {}
