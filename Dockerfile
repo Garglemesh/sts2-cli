@@ -14,10 +14,9 @@
 # ──────────────────────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/sdk:9.0
 
-# System Python (the dotnet SDK image is Debian; python3 here is 3.11).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+# `uv` (a fast Python/venv manager, single static binary) provisions a modern
+# Python — the Debian base only ships 3.11, but our pinned deps (numpy 2.5) need 3.12+.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
@@ -27,12 +26,12 @@ COPY src/ ./src/
 COPY lib/ ./lib/
 RUN dotnet build src/Sts2Headless/Sts2Headless.csproj -c Debug
 
-# 2) Python training environment. Kept at /opt/venv (outside /app) so a bind-mount
-#    of ./rl during development never shadows it.
+# 2) Python training environment (Python 3.13). Kept at /opt/venv (outside /app)
+#    so a bind-mount of ./rl during development never shadows it. uv downloads a
+#    standalone CPython 3.13 and installs the pinned deps into the venv.
 COPY rl/requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+RUN uv venv --python 3.13 /opt/venv \
+    && uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/requirements.txt
 
 # 3) Runtime assets the engine needs (localization tables) + the RL code.
 COPY localization_eng/ ./localization_eng/
