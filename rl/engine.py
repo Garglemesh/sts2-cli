@@ -18,8 +18,13 @@ import subprocess
 
 # Repo root is one level up from this file (…/sts2-cli/rl/engine.py -> …/sts2-cli)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CSPROJ = os.path.join(REPO_ROOT, "src", "Sts2Headless", "Sts2Headless.csproj")
 LIB_DIR = os.path.join(REPO_ROOT, "lib")
+# Launch the *compiled* DLL directly rather than `dotnet run`. `dotnet run` re-evaluates
+# the project via MSBuild on every launch (~0.3s + lock contention under parallelism);
+# the built DLL boots in ~0.05s. Build it once: `dotnet build src/Sts2Headless/...`.
+ENGINE_DLL = os.path.join(
+    REPO_ROOT, "src", "Sts2Headless", "bin", "Debug", "net9.0", "Sts2Headless.dll"
+)
 
 # ── The fixed scenario for Phase 1 ───────────────────────────────────────────
 # A deterministic, winnable fight so the agent has a stable target to learn.
@@ -47,16 +52,22 @@ class Engine:
     """Owns one engine subprocess and the JSON conversation with it."""
 
     def __init__(self) -> None:
+        if not os.path.isfile(ENGINE_DLL):
+            raise FileNotFoundError(
+                f"Engine not built: {ENGINE_DLL}\n"
+                f"Build it first: dotnet build src/Sts2Headless/Sts2Headless.csproj"
+            )
         env = dict(os.environ)
         # Tell the engine where the patched game DLLs live (the lib/ folder).
         env["STS2_GAME_DIR"] = LIB_DIR
         self.proc = subprocess.Popen(
-            ["dotnet", "run", "--no-build", "--project", CSPROJ],
+            ["dotnet", ENGINE_DLL],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,  # the engine prints lots of debug to stderr; ignore it
             text=True,
             cwd=REPO_ROOT,
+            env=env,
         )
         # The engine emits one line, {"type":"ready",...}, when it has booted.
         self._read()
