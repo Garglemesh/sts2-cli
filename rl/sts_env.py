@@ -12,9 +12,9 @@ through this class:
 Everything game-specific — turning the JSON game state into numbers (the
 "observation"), deciding which actions exist, computing the reward — lives here.
 
-Milestone 1 scope: Ironclad vs. ONE weak enemy, fixed starter deck. A single enemy
-means we don't need to choose *which* enemy to target, which keeps the action space
-small. We'll lift that restriction in a later phase.
+Phase 2 scope: Ironclad (fixed starter deck) vs. a RANDOM encounter from a pool with
+1–3 enemies. Multiple enemies means the agent must choose *which* enemy to target,
+so the action space is now (card slot x enemy target) plus end-turn.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from engine import Engine
+from engine import Engine, ENCOUNTER_POOL
 
 
 # ── Encoding constants ───────────────────────────────────────────────────────
@@ -33,9 +33,12 @@ CARD_VOCAB = ["STRIKE_IRONCLAD", "DEFEND_IRONCLAD", "BASH", "UNK"]
 CARD_INDEX = {name: i for i, name in enumerate(CARD_VOCAB)}
 V = len(CARD_VOCAB)
 
-MAX_HAND = 10          # fixed number of hand slots the action space exposes
-END_TURN_ACTION = MAX_HAND   # the last action id = "end turn"
-N_ACTIONS = MAX_HAND + 1
+MAX_HAND = 10          # hand slots the action space exposes
+MAX_ENEMIES = 5        # enemy target slots the action space exposes
+# Action layout: a < MAX_HAND*MAX_ENEMIES means "play hand card (a//ME) at enemy
+# (a%ME)"; the final id is "end turn".
+N_ACTIONS = MAX_HAND * MAX_ENEMIES + 1
+END_TURN_ACTION = N_ACTIONS - 1
 
 # Status effects ("powers") the agent should see — keyed on the engine's English
 # power names (we run the engine in English). Amounts are normalized by ~5.
@@ -112,19 +115,20 @@ class StsCombatEnv(gym.Env):
         self.state: dict = {}
         self._prev_hp: float = MAX_HP
 
-        # --- Action space: play hand slot 0..9, or end turn (id 10). ---
+        # --- Action space: (hand slot x enemy target) + end turn. ---
         self.action_space = spaces.Discrete(N_ACTIONS)
 
         # --- Observation space: a flat vector of floats. Layout (mirrors what a
         #     human player can see):
         #   player  : hp, block, energy                              (3)
         #   player powers : amount per POWER_VOCAB                   (P)
-        #   enemy   : hp_frac, block                                 (2)
-        #   enemy intent  : incoming_damage, is_attack, is_debuff    (3)
-        #   enemy powers  : amount per POWER_VOCAB                   (P)
+        #   enemies : MAX_ENEMIES slots x per-enemy block            (ME * E_FEATS)
+        #             where each = alive, hp_frac, block, incoming_dmg,
+        #                          is_attack, is_debuff, powers(P)
         #   hand    : MAX_HAND slots x (card one-hot V + cost + playable)
         #   piles   : draw/discard/exhaust counts over V             (3V)
-        obs_dim = 3 + P + 2 + 3 + P + MAX_HAND * (V + 2) + 3 * V
+        self.E_FEATS = 6 + P
+        obs_dim = 3 + P + MAX_ENEMIES * self.E_FEATS + MAX_HAND * (V + 2) + 3 * V
         self.observation_space = spaces.Box(
             low=-1.0, high=10.0, shape=(obs_dim,), dtype=np.float32
         )
@@ -132,11 +136,13 @@ class StsCombatEnv(gym.Env):
     # ── Gym API ─────────────────────────────────────────────────────────────
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        # Reuse one long-lived engine; reset_to_fixed_combat() does a fast in-process
+        # Reuse one long-lived engine; reset_to_combat() does a fast in-process
         # combat reset (~1-2ms) after the first (one-time ~0.8s) setup.
         if self.engine is None:
             self.engine = Engine()
-        self.state = self.engine.reset_to_fixed_combat()
+        # Pick a random encounter from the pool (self.np_random is seeded by Gym).
+        encounter = ENCOUNTER_POOL[self.np_random.integers(len(ENCOUNTER_POOL))]
+        self.state = self.engine.reset_to_combat(encounter)
         self._prev_hp = float(self.state.get("player", {}).get("hp", MAX_HP))
         return self._encode(self.state), {}
 
@@ -145,7 +151,8 @@ class StsCombatEnv(gym.Env):
         if action == END_TURN_ACTION:
             self.state = self.engine.action("end_turn")
         else:
-            self.state = self._play_card(action)
+            card_slot, target_slot = divmod(action, MAX_ENEMIES)
+            self.state = self._play(card_slot, target_slot)
 
         reward, terminated, outcome = self._reward_and_done(self.state)
         obs = self._encode(self.state)
@@ -158,12 +165,24 @@ class StsCombatEnv(gym.Env):
     def action_masks(self) -> np.ndarray:
         """Boolean array (len N_ACTIONS): which actions are legal this turn.
 
+        For a playable card targeting AnyEnemy, every living enemy is a legal target.
+        For a card that doesn't pick an enemy (Self/All/None), only target slot 0 is
+        offered (the target is ignored), so the agent isn't shown redundant choices.
         MaskablePPO calls this so the policy never picks an illegal move."""
         mask = np.zeros(N_ACTIONS, dtype=bool)
         hand = self.state.get("hand") or []
+        n_enemies = min(len(self.state.get("enemies") or []), MAX_ENEMIES)
         for i in range(min(len(hand), MAX_HAND)):
-            mask[i] = bool(hand[i].get("can_play", False))
-        mask[END_TURN_ACTION] = True   # ending the turn is always legal
+            card = hand[i]
+            if not card.get("can_play"):
+                continue
+            base = i * MAX_ENEMIES
+            if card.get("target_type") == "AnyEnemy":
+                for j in range(n_enemies):
+                    mask[base + j] = True
+            else:
+                mask[base + 0] = True   # canonical no-target action
+        mask[END_TURN_ACTION] = True    # ending the turn is always legal
         return mask
 
     def close(self):
@@ -172,15 +191,15 @@ class StsCombatEnv(gym.Env):
             self.engine = None
 
     # ── Helpers ──────────────────────────────────────────────────────────────
-    def _play_card(self, slot: int) -> dict:
+    def _play(self, card_slot: int, target_slot: int) -> dict:
         hand = self.state.get("hand") or []
-        if slot >= len(hand):
+        if card_slot >= len(hand):
             return self.state  # illegal (mask should prevent this); no-op
-        card = hand[slot]
-        # AnyEnemy cards need a target; with one enemy, target 0.
+        card = hand[card_slot]
+        # AnyEnemy cards target the chosen living enemy; others ignore the target.
         if card.get("target_type") == "AnyEnemy":
-            return self.engine.action("play_card", card_index=slot, target_index=0)
-        return self.engine.action("play_card", card_index=slot)
+            return self.engine.action("play_card", card_index=card_slot, target_index=target_slot)
+        return self.engine.action("play_card", card_index=card_slot)
 
     def _reward_and_done(self, state: dict) -> tuple[float, bool, str | None]:
         decision = state.get("decision")
@@ -199,10 +218,23 @@ class StsCombatEnv(gym.Env):
         self._prev_hp = hp
         return reward, False, None
 
+    def _enemy_block(self, enemy: dict) -> np.ndarray:
+        """Per-enemy feature block: alive, hp_frac, block, intent, powers."""
+        e_max = max(1.0, float(enemy.get("max_hp", 1) or 1))
+        is_attack, is_debuff = _intent_flags(enemy)
+        scalars = np.array([
+            1.0,                                              # alive flag
+            float(enemy.get("hp", 0)) / e_max,
+            float(enemy.get("block", 0)) / NORM_BLOCK,
+            _incoming_damage(enemy) / MAX_HP,
+            is_attack,
+            is_debuff,
+        ], dtype=np.float32)
+        return np.concatenate([scalars, _power_vec(enemy.get("powers"))])
+
     def _encode(self, state: dict) -> np.ndarray:
         p = state.get("player", {})
         enemies = state.get("enemies") or []
-        enemy = enemies[0] if enemies else {}
 
         parts: list[np.ndarray] = []
         # player scalars
@@ -211,23 +243,14 @@ class StsCombatEnv(gym.Env):
             float(p.get("block", 0)) / NORM_BLOCK,
             float(state.get("energy", 0)) / NORM_ENERGY,
         ], dtype=np.float32))
-        # player status effects (e.g. Shrink from the beetle)
+        # player status effects (e.g. Shrink)
         parts.append(_power_vec(state.get("player_powers")))
-        # enemy scalars
-        e_max = max(1.0, float(enemy.get("max_hp", 1) or 1))
-        parts.append(np.array([
-            float(enemy.get("hp", 0)) / e_max,
-            float(enemy.get("block", 0)) / NORM_BLOCK,
-        ], dtype=np.float32))
-        # enemy intent: how much damage is coming, and what kind of move
-        is_attack, is_debuff = _intent_flags(enemy)
-        parts.append(np.array([
-            _incoming_damage(enemy) / MAX_HP,
-            is_attack,
-            is_debuff,
-        ], dtype=np.float32))
-        # enemy status effects (e.g. Vulnerable from Bash)
-        parts.append(_power_vec(enemy.get("powers")))
+        # enemies: one fixed-size block per slot; empty slots are zeros (alive=0).
+        for j in range(MAX_ENEMIES):
+            if j < len(enemies):
+                parts.append(self._enemy_block(enemies[j]))
+            else:
+                parts.append(np.zeros(self.E_FEATS, dtype=np.float32))
         # hand: MAX_HAND slots
         hand = state.get("hand") or []
         for i in range(MAX_HAND):

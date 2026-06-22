@@ -42,6 +42,17 @@ FIXED_DECK = (
 )
 FIXED_ENCOUNTER = "SHRINKER_BEETLE_WEAK"
 
+# Phase 2: a pool of early encounters with 1–3 enemies. The env picks one per
+# episode so the agent learns to fight varied compositions and choose targets.
+ENCOUNTER_POOL = [
+    "SHRINKER_BEETLE_WEAK",   # 1 enemy
+    "CORPSE_SLUGS_WEAK",      # 2 enemies
+    "BOWLBUGS_WEAK",          # 2 enemies
+    "CULTISTS_NORMAL",        # 2 enemies
+    "INKLETS_NORMAL",         # 3 enemies (low HP)
+    "EXOSKELETONS_WEAK",      # 3 enemies
+]
+
 # Decisions that can appear between starting a run and entering our combat
 # (e.g. the Neow blessing screen). We resolve them with a trivial default so we
 # always land in the same place.
@@ -72,6 +83,7 @@ class Engine:
         # The engine emits one line, {"type":"ready",...}, when it has booted.
         self.last = self._read()
         self._started = False   # has start_run been done in this process yet?
+        self._encounter = FIXED_ENCOUNTER   # which fight the next reset enters
 
     # --- raw IO -------------------------------------------------------------
     def _read(self) -> dict:
@@ -110,12 +122,18 @@ class Engine:
         makes training practical. Falls back to a full process respawn if the fast
         path ever lands somewhere unexpected (engine crash, surprise decision).
         """
+        return self.reset_to_combat(FIXED_ENCOUNTER)
+
+    def reset_to_combat(self, encounter: str) -> dict:
+        """Like reset_to_fixed_combat, but for a specific encounter (Phase 2)."""
+        self._encounter = encounter
         if not self._started:
             return self._full_reset()
         try:
             return self._fast_reset()
         except Exception:
             self._respawn()
+            self._encounter = encounter   # _respawn() reset it via __init__
             return self._full_reset()
 
     def _full_reset(self) -> dict:
@@ -149,9 +167,9 @@ class Engine:
         return state
 
     def _enter_fixed_combat(self) -> dict:
-        """Restore HP + fixed deck, then start the fixed encounter."""
+        """Restore HP + fixed deck, then start the chosen encounter."""
         self.send({"cmd": "set_player", "hp": 80, "deck": list(FIXED_DECK)})
-        return self.send({"cmd": "enter_room", "type": "combat", "encounter": FIXED_ENCOUNTER})
+        return self.send({"cmd": "enter_room", "type": "combat", "encounter": self._encounter})
 
     def _resolve_intermediate(self, state: dict) -> dict:
         """Answer one Neow/reward/selection screen with a trivial default."""
