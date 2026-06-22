@@ -147,10 +147,13 @@ class StsCombatEnv(gym.Env):
         else:
             self.state = self._play_card(action)
 
-        reward, terminated = self._reward_and_done(self.state)
+        reward, terminated, outcome = self._reward_and_done(self.state)
         obs = self._encode(self.state)
+        # `outcome` on the terminal step is "won" (enemy killed) or "died" (game over),
+        # so callers can measure true survival separately from the reward score.
+        info = {"outcome": outcome} if terminated else {}
         # `truncated` would be for hitting a step limit; we don't use one yet.
-        return obs, reward, terminated, False, {}
+        return obs, reward, terminated, False, info
 
     def action_masks(self) -> np.ndarray:
         """Boolean array (len N_ACTIONS): which actions are legal this turn.
@@ -179,22 +182,22 @@ class StsCombatEnv(gym.Env):
             return self.engine.action("play_card", card_index=slot, target_index=0)
         return self.engine.action("play_card", card_index=slot)
 
-    def _reward_and_done(self, state: dict) -> tuple[float, bool]:
+    def _reward_and_done(self, state: dict) -> tuple[float, bool, str | None]:
         decision = state.get("decision")
         # Player died → engine reports game_over (not a victory).
         if decision == "game_over" or state.get("type") == "error":
             hp = float(state.get("player", {}).get("hp", 0.0))
             reward = -0.5 * max(0.0, self._prev_hp - hp)
-            return reward, True
+            return reward, True, "died"
         # Left combat (enemy dead) → we won this fight. Any decision that isn't
         # combat_play here means the combat resolved in our favor.
         if decision != "combat_play":
-            return 10.0, True
+            return 10.0, True, "won"
         # Still fighting: penalize HP lost since the previous step.
         hp = float(state.get("player", {}).get("hp", self._prev_hp))
         reward = -0.5 * max(0.0, self._prev_hp - hp)
         self._prev_hp = hp
-        return reward, False
+        return reward, False, None
 
     def _encode(self, state: dict) -> np.ndarray:
         p = state.get("player", {})
